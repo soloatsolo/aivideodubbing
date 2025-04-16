@@ -1,0 +1,286 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row =>
+                    row.some(cell => cell !== '' && cell !== null && cell !== undefined)
+                );
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Dubbing App</title>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.20.6/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef, useEffect } = React;
+
+    function App() {
+      const [file, setFile] = useState(null);
+      const [status, setStatus] = useState('');
+      const [progress, setProgress] = useState(0);
+      const [progressDetails, setProgressDetails] = useState({});
+      const [outputUrl, setOutputUrl] = useState('');
+      const [error, setError] = useState(null);
+      const [enableLipSync, setEnableLipSync] = useState(false);
+      const [enableSubtitles, setEnableSubtitles] = useState(false);
+      const [backgroundVolume, setBackgroundVolume] = useState(30);
+      const [sourceLang, setSourceLang] = useState('en');
+      const videoRef = useRef(null);
+      const formRef = useRef(null);
+      const progressSource = useRef(null);
+
+      const handleFileChange = (e) => {
+        setFile(e.target.files[0]);
+        setStatus('');
+        setOutputUrl('');
+        setProgress(0);
+        setError(null);
+        setProgressDetails({});
+      };
+
+      const startProgressTracking = (sessionId) => {
+        if (progressSource.current) {
+          progressSource.current.close();
+        }
+
+        progressSource.current = new EventSource(`/progress/${sessionId}`);
+        
+        progressSource.current.onmessage = (event) => {
+          const data = JSON.parse(event.data);
+          
+          if (data.error) {
+            setError(data.error);
+            progressSource.current.close();
+            return;
+          }
+          
+          if (data.status === "complete") {
+            progressSource.current.close();
+            return;
+          }
+
+          setProgressDetails(prev => ({
+            ...prev,
+            [data.stage]: {
+              progress: data.progress,
+              message: data.message
+            }
+          }));
+
+          if (data.stage === 'overall') {
+            setProgress(data.progress);
+            setStatus(data.message);
+          }
+        };
+
+        progressSource.current.onerror = () => {
+          progressSource.current.close();
+        };
+      };
+
+      const handleSubmit = async (e) => {
+        e.preventDefault();
+        
+        if (!file) {
+          setError('يرجى اختيار ملف فيديو');
+          return;
+        }
+
+        setStatus('جارٍ التحميل...');
+        setProgress(10);
+        setError(null);
+
+        const formData = new FormData();
+        formData.append('video', file);
+        formData.append('sourceLang', sourceLang);
+        formData.append('enableLipSync', enableLipSync);
+        formData.append('enableSubtitles', enableSubtitles);
+        formData.append('backgroundVolume', backgroundVolume);
+
+        try {
+          const response = await fetch('http://localhost:5000/dub', {
+            method: 'POST',
+            body: formData,
+          });
+
+          const contentType = response.headers.get("content-type");
+          
+          if (!response.ok) {
+            const errorData = await response.json();
+            if (errorData.session_id) {
+              startProgressTracking(errorData.session_id);
+            }
+            throw new Error(errorData.error || 'حدث خطأ أثناء معالجة الفيديو');
+          }
+
+          if (contentType && contentType.includes("application/json")) {
+            const data = await response.json();
+            if (data.session_id) {
+              startProgressTracking(data.session_id);
+            }
+          } else {
+            const blob = await response.blob();
+            const url = URL.createObjectURL(blob);
+            setOutputUrl(url);
+            setStatus('اكتمل الدبلاج!');
+            setProgress(100);
+          }
+        } catch (error) {
+          setError(error.message);
+          setProgress(0);
+        }
+      };
+
+      useEffect(() => {
+        // Cleanup on component unmount
+        return () => {
+          if (progressSource.current) {
+            progressSource.current.close();
+          }
+          if (outputUrl) {
+            URL.revokeObjectURL(outputUrl);
+          }
+        };
+      }, [outputUrl]);
+
+      useEffect(() => {
+        // Reset error when options change
+        setError(null);
+      }, [enableLipSync, enableSubtitles, backgroundVolume, sourceLang]);
+
+      const renderProgressDetails = () => {
+        const stages = {
+          extraction: 'استخراج الصوت',
+          transcription: 'التعرف على النص',
+          translation: 'الترجمة',
+          audio_generation: 'إنشاء الصوت العربي',
+          lip_sync: 'مزامنة الشفاه',
+          subtitles: 'إنشاء الترجمات',
+          audio_separation: 'فصل الصوت',
+          merging: 'دمج الصوت مع الفيديو'
+        };
+
+        return Object.entries(progressDetails).map(([stage, data]) => {
+          if (stage === 'overall') return null;
+          return (
+            <div key={stage} className="mt-2">
+              <div className="flex justify-between text-sm text-gray-600">
+                <span>{stages[stage]}</span>
+                <span>{data.progress}%</span>
+              </div>
+              <div className="w-full bg-gray-200 rounded-full h-2">
+                <div
+                  className="bg-blue-400 h-2 rounded-full transition-all duration-300"
+                  style={{ width: `${data.progress}%` }}
+                ></div>
+              </div>
+              <p className="text-xs text-gray-500 mt-1">{data.message}</p>
+            </div>
+          );
+        });
+      };
+
+      return (
+        <div className="min-h-screen bg-gradient-to-r from-blue-100 to-gray-100 flex flex-col items-center justify-center p-6">
+          <h1 className="text-4xl font-bold text-blue-800 mb-8">تطبيق الدبلجة بالذكاء الاصطناعي</h1>
+          
+          <form ref={formRef} onSubmit={handleSubmit} className="bg-white rounded-xl shadow-2xl p-8 w-full max-w-lg">
+            <div className="mb-6">
+              <label className="block text-gray-700 text-lg mb-2">اختر ملف الفيديو</label>
+              <input
+                type="file"
+                accept="video/*"
+                onChange={handleFileChange}
+                className="w-full text-sm text-gray-500 file:mr-4 file:py-3 file:px-6 file:rounded-full file:border-0 file:bg-blue-500 file:text-white file:hover:bg-blue-600"
+              />
+            </div>
+
+            {error && (
+              <div className="mb-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded">
+                {error}
+              </div>
+            )}
+
+            <button
+              type="submit"
+              disabled={progress > 0 && progress < 100}
+              className={`w-full py-3 rounded-full text-lg font-semibold text-white transition-colors ${
+                progress > 0 && progress < 100
+                  ? 'bg-gray-400 cursor-not-allowed'
+                  : 'bg-blue-600 hover:bg-blue-700'
+              }`}
+            >
+              ابدأ الدبلجة
+            </button>
+
+            {status && (
+              <div className="mt-6">
+                <p className="text-gray-700 text-center font-semibold">{status}</p>
+                <div className="w-full bg-gray-200 rounded-full h-4 mt-2">
+                  <div
+                    className="bg-blue-600 h-4 rounded-full transition-all duration-300"
+                    style={{ width: `${progress}%` }}
+                  ></div>
+                </div>
+                <div className="mt-4 space-y-2">
+                  {renderProgressDetails()}
+                </div>
+              </div>
+            )}
+
+            {outputUrl && (
+              <div className="mt-6">
+                <p className="text-gray-700 text-center mb-2">الفيديو المدبلج:</p>
+                <video
+                  ref={videoRef}
+                  src={outputUrl}
+                  controls
+                  className="w-full rounded-lg shadow-md"
+                />
+                <a
+                  href={outputUrl}
+                  download="dubbed_video.mp4"
+                  className="block mt-4 text-center bg-green-500 text-white py-2 rounded-full hover:bg-green-600"
+                >
+                  تحميل الفيديو
+                </a>
+              </div>
+            )}
+          </form>
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>

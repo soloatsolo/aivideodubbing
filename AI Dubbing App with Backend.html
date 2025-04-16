@@ -1,0 +1,206 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row =>
+                    row.some(cell => cell !== '' && cell !== null && cell !== undefined)
+                );
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>تطبيق الدبلجة بالذكاء الاصطناعي</title>
+  <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.20.6/babel.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState, useRef } = React;
+
+    function App() {
+      const [file, setFile] = useState(null);
+      const [status, setStatus] = useState('');
+      const [progress, setProgress] = useState(0);
+      const [outputUrl, setOutputUrl] = useState('');
+      const [audioPreviewUrl, setAudioPreviewUrl] = useState('');
+      const [error, setError] = useState('');
+      const videoRef = useRef(null);
+      const audioRef = useRef(null);
+
+      const handleFileChange = (e) => {
+        setFile(e.target.files[0]);
+        setStatus('');
+        setOutputUrl('');
+        setAudioPreviewUrl('');
+        setProgress(0);
+        setError('');
+      };
+
+      const handleUpload = async () => {
+        if (!file) {
+          setError('يرجى اختيار ملف فيديو');
+          return;
+        }
+
+        setStatus('جارٍ رفع الفيديو...');
+        setProgress(10);
+        setError('');
+
+        try {
+          const formData = new FormData();
+          formData.append('video', file);
+
+          // رفع الفيديو
+          const uploadResponse = await fetch('http://localhost:8000/upload', {
+            method: 'POST',
+            body: formData,
+          });
+          if (!uploadResponse.ok) throw new Error('فشل رفع الفيديو');
+          const uploadData = await uploadResponse.json();
+
+          setStatus('جارٍ استخراج الصوت...');
+          setProgress(30);
+
+          // معالجة الصوت
+          const processResponse = await fetch('http://localhost:8000/process', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ fileName: uploadData.fileName, targetLanguage: 'ar' }),
+          });
+          if (!processResponse.ok) throw new Error('فشل معالجة الصوت');
+          const processData = await processResponse.json();
+
+          setStatus('جارٍ معاينة الصوت المدبلج...');
+          setProgress(50);
+          setAudioPreviewUrl(`http://localhost:8000/download/${processData.audioUrl}`);
+
+          // دمج الصوت مع الفيديو
+          setStatus('جارٍ دمج الصوت مع الفيديو...');
+          setProgress(70);
+
+          const syncResponse = await fetch('http://localhost:8000/sync', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ audioUrl: processData.audioUrl, videoFile: uploadData.fileName }),
+          });
+          if (!syncResponse.ok) throw new Error('فشل دمج الفيديو');
+          const syncData = await syncResponse.json();
+
+          setStatus('اكتمل الدبلاج!');
+          setProgress(100);
+          setOutputUrl(`http://localhost:8000/download/${syncData.videoUrl}`);
+        } catch (err) {
+          setError('حدث خطأ: ' + err.message);
+          setStatus('');
+          setProgress(0);
+        }
+      };
+
+      return (
+        <div className="min-h-screen bg-gradient-to-r from-blue-200 to-gray-200 flex flex-col items-center justify-center p-6">
+          <h1 className="text-5xl font-bold text-blue-900 mb-10">تطبيق الدبلجة بالذكاء الاصطناعي</h1>
+          
+          <div className="bg-white rounded-2xl shadow-xl p-10 w-full max-w-2xl">
+            <div className="mb-8">
+              <label className="block text-gray-800 text-xl font-semibold mb-3">اختر ملف الفيديو</label>
+              <input
+                type="file"
+                accept="video/*"
+                onChange={handleFileChange}
+                className="w-full text-lg text-gray-600 file:mr-5 file:py-4 file:px-8 file:rounded-full file:border-0 file:bg-blue-600 file:text-white file:hover:bg-blue-700"
+              />
+            </div>
+
+            <button
+              onClick={handleUpload}
+              disabled={progress > 0 && progress < 100}
+              className={`w-full py-4 rounded-full text-xl font-bold text-white transition-colors ${
+                progress > 0 && progress < 100
+                  ? 'bg-gray-500 cursor-not-allowed'
+                  : 'bg-blue-700 hover:bg-blue-800'
+              }`}
+            >
+              ابدأ الدبلجة
+            </button>
+
+            {status && (
+              <div className="mt-8">
+                <p className="text-gray-800 text-center text-lg">{status}</p>
+                <div className="w-full bg-gray-300 rounded-full h-5 mt-3">
+                  <div
+                    className="bg-blue-700 h-5 rounded-full transition-all duration-300"
+                    style={{ width: `${progress}%` }}
+                  ></div>
+                </div>
+              </div>
+            )}
+
+            {error && (
+              <p className="mt-6 text-red-600 text-center text-lg font-medium">{error}</p>
+            )}
+
+            {audioPreviewUrl && (
+              <div className="mt-8">
+                <p className="text-gray-800 text-center text-lg mb-3">معاينة الصوت المدبلج:</p>
+                <audio
+                  ref={audioRef}
+                  src={audioPreviewUrl}
+                  controls
+                  className="w-full"
+                />
+              </div>
+            )}
+
+            {outputUrl && (
+              <div className="mt-8">
+                <p className="text-gray-800 text-center text-lg mb-3">الفيديو المدبلج:</p>
+                <video
+                  ref={videoRef}
+                  src={outputUrl}
+                  controls
+                  className="w-full rounded-lg shadow-md"
+                />
+                <a
+                  href={outputUrl}
+                  download="dubbed_video.mp4"
+                  className="block mt-6 text-center bg-green-600 text-white py-3 rounded-full text-lg font-semibold hover:bg-green-700"
+                >
+                  تحميل الفيديو
+                </a>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    ReactDOM.render(<App />, document.getElementById('root'));
+  </script>
+</body>
+</html>
