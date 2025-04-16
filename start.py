@@ -36,7 +36,6 @@ def check_dependencies():
     required_packages = [
         'flask==3.1.0',
         'flask-cors==5.0.1',
-        'werkzeug==3.0.1',
         'moviepy==2.1.2',
         'openai-whisper==20240930',
         'transformers==4.51.3',
@@ -47,14 +46,7 @@ def check_dependencies():
         'gTTS==2.5.4',
         'soundfile==0.13.1',
         'scipy>=1.15.2',
-        'scikit-learn>=1.6.1',
-        'spleeter==2.4.0',
-        'face_alignment==1.3.5',
-        'imageio==2.9.0',
-        'pysubs2==1.4.2',
-        'gradio==4.19.1',
-        'opencv-python==4.9.0.80',
-        'opencv-python-headless==4.9.0.80'
+        'scikit-learn>=1.6.1'
     ]
     
     missing = []
@@ -99,21 +91,10 @@ def install_dependencies(missing_packages):
     if missing_packages:
         print("\nInstalling missing packages...")
         try:
-            # First install torch and torchaudio
-            torch_packages = [p for p in missing_packages if p.startswith(('torch==', 'torchaudio=='))]
-            other_packages = [p for p in missing_packages if not p.startswith(('torch==', 'torchaudio=='))]
-            
-            if torch_packages:
-                print("Installing PyTorch packages...")
-                subprocess.run([sys.executable, '-m', 'pip', 'install'] + torch_packages, check=True)
-            
-            if other_packages:
-                print("Installing other packages...")
-                subprocess.run([sys.executable, '-m', 'pip', 'install'] + other_packages, check=True)
-            
+            subprocess.run([sys.executable, '-m', 'pip', 'install'] + missing_packages, check=True)
             return True
-        except subprocess.CalledProcessError as e:
-            print(f"Failed to install some packages: {str(e)}")
+        except subprocess.CalledProcessError:
+            print("Failed to install some packages")
             return False
     return True
 
@@ -137,10 +118,6 @@ def main():
             sys.exit(1)
     
     print("\nAll requirements satisfied! Starting the application...")
-    
-    # Create necessary directories
-    for dir_name in ['temp', 'logs', 'model_cache']:
-        os.makedirs(dir_name, exist_ok=True)
     
     # Start the application
     try:

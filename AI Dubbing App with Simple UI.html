@@ -32,7 +32,7 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>AI Dubbing App</title>
+  <title>تطبيق الدبلجة بالذكاء الاصطناعي</title>
   <script src="https://cdn.jsdelivr.net/npm/react@18.2.0/umd/react.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/react-dom@18.2.0/umd/react-dom.production.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@babel/standalone@7.20.6/babel.min.js"></script>
@@ -49,22 +49,30 @@
       const [progress, setProgress] = useState(0);
       const [progressDetails, setProgressDetails] = useState({});
       const [outputUrl, setOutputUrl] = useState('');
+      const [audioPreviewUrl, setAudioPreviewUrl] = useState('');
       const [error, setError] = useState(null);
-      const [enableLipSync, setEnableLipSync] = useState(false);
-      const [enableSubtitles, setEnableSubtitles] = useState(false);
-      const [backgroundVolume, setBackgroundVolume] = useState(30);
       const [sourceLang, setSourceLang] = useState('en');
       const videoRef = useRef(null);
+      const audioRef = useRef(null);
       const formRef = useRef(null);
       const progressSource = useRef(null);
 
       const handleFileChange = (e) => {
-        setFile(e.target.files[0]);
-        setStatus('');
-        setOutputUrl('');
-        setProgress(0);
-        setError(null);
-        setProgressDetails({});
+        const selectedFile = e.target.files[0];
+        if (selectedFile) {
+          const allowedTypes = ['video/mp4', 'video/avi', 'video/quicktime', 'video/x-matroska'];
+          if (!allowedTypes.includes(selectedFile.type)) {
+            setError('نوع الملف غير مدعوم. الرجاء اختيار ملف MP4, AVI, MOV, أو MKV');
+            return;
+          }
+          setFile(selectedFile);
+          setStatus('');
+          setOutputUrl('');
+          setAudioPreviewUrl('');
+          setProgress(0);
+          setError(null);
+          setProgressDetails({});
+        }
       };
 
       const startProgressTracking = (sessionId) => {
@@ -122,9 +130,6 @@
         const formData = new FormData();
         formData.append('video', file);
         formData.append('sourceLang', sourceLang);
-        formData.append('enableLipSync', enableLipSync);
-        formData.append('enableSubtitles', enableSubtitles);
-        formData.append('backgroundVolume', backgroundVolume);
 
         try {
           const response = await fetch('http://localhost:5000/dub', {
@@ -147,6 +152,10 @@
             if (data.session_id) {
               startProgressTracking(data.session_id);
             }
+            if (data.audioPreviewUrl) {
+              setAudioPreviewUrl(data.audioPreviewUrl);
+              setStatus('تم إنشاء معاينة الصوت');
+            }
           } else {
             const blob = await response.blob();
             const url = URL.createObjectURL(blob);
@@ -161,21 +170,12 @@
       };
 
       useEffect(() => {
-        // Cleanup on component unmount
         return () => {
           if (progressSource.current) {
             progressSource.current.close();
           }
-          if (outputUrl) {
-            URL.revokeObjectURL(outputUrl);
-          }
         };
-      }, [outputUrl]);
-
-      useEffect(() => {
-        // Reset error when options change
-        setError(null);
-      }, [enableLipSync, enableSubtitles, backgroundVolume, sourceLang]);
+      }, []);
 
       const renderProgressDetails = () => {
         const stages = {
@@ -183,8 +183,6 @@
           transcription: 'التعرف على النص',
           translation: 'الترجمة',
           audio_generation: 'إنشاء الصوت العربي',
-          lip_sync: 'مزامنة الشفاه',
-          subtitles: 'إنشاء الترجمات',
           audio_separation: 'فصل الصوت',
           merging: 'دمج الصوت مع الفيديو'
         };
@@ -211,68 +209,111 @@
 
       return (
         <div className="min-h-screen bg-gradient-to-r from-blue-100 to-gray-100 flex flex-col items-center justify-center p-6">
-          <h1 className="text-4xl font-bold text-blue-800 mb-8">تطبيق الدبلجة بالذكاء الاصطناعي</h1>
+          <h1 className="text-4xl md:text-5xl font-bold text-blue-800 mb-8">تطبيق الدبلجة بالذكاء الاصطناعي</h1>
           
-          <form ref={formRef} onSubmit={handleSubmit} className="bg-white rounded-xl shadow-2xl p-8 w-full max-w-lg">
+          <form onSubmit={handleSubmit} className="bg-white rounded-xl shadow-2xl p-8 w-full max-w-2xl">
+            <div className="mb-6">
+              <label className="block text-gray-700 text-lg mb-2">اللغة المصدر</label>
+              <select
+                value={sourceLang}
+                onChange={(e) => setSourceLang(e.target.value)}
+                className="w-full p-3 border border-gray-300 rounded-lg text-gray-700 focus:border-blue-500 focus:ring-1 focus:ring-blue-500"
+              >
+                <option value="en">الإنجليزية</option>
+                <option value="fr">الفرنسية</option>
+                <option value="es">الإسبانية</option>
+                <option value="de">الألمانية</option>
+              </select>
+            </div>
+
             <div className="mb-6">
               <label className="block text-gray-700 text-lg mb-2">اختر ملف الفيديو</label>
               <input
                 type="file"
-                accept="video/*"
+                accept="video/mp4,video/x-m4v,video/*"
                 onChange={handleFileChange}
-                className="w-full text-sm text-gray-500 file:mr-4 file:py-3 file:px-6 file:rounded-full file:border-0 file:bg-blue-500 file:text-white file:hover:bg-blue-600"
+                className="w-full text-sm text-gray-500 file:mr-4 file:py-3 file:px-6 file:rounded-full file:border-0 file:bg-blue-500 file:text-white file:hover:bg-blue-600 cursor-pointer"
               />
+              <p className="mt-2 text-sm text-gray-500">الأنواع المدعومة: MP4, AVI, MOV, MKV</p>
             </div>
 
             {error && (
-              <div className="mb-4 p-3 bg-red-100 border border-red-400 text-red-700 rounded">
-                {error}
+              <div className="mb-6 p-4 bg-red-50 border border-red-200 rounded-lg">
+                <p className="text-red-600">{error}</p>
               </div>
             )}
 
             <button
               type="submit"
-              disabled={progress > 0 && progress < 100}
-              className={`w-full py-3 rounded-full text-lg font-semibold text-white transition-colors ${
-                progress > 0 && progress < 100
+              disabled={!file || (progress > 0 && progress < 100)}
+              className={`w-full py-4 rounded-full text-lg font-semibold text-white transition-colors ${
+                !file || (progress > 0 && progress < 100)
                   ? 'bg-gray-400 cursor-not-allowed'
                   : 'bg-blue-600 hover:bg-blue-700'
               }`}
             >
-              ابدأ الدبلجة
+              {progress > 0 && progress < 100 ? 'جارٍ المعالجة...' : 'ابدأ الدبلجة'}
             </button>
 
-            {status && (
-              <div className="mt-6">
-                <p className="text-gray-700 text-center font-semibold">{status}</p>
-                <div className="w-full bg-gray-200 rounded-full h-4 mt-2">
+            {status && progress > 0 && (
+              <div className="mt-8">
+                <p className="text-gray-700 text-center font-semibold mb-2">{status}</p>
+                <div className="w-full bg-gray-200 rounded-full h-4">
                   <div
                     className="bg-blue-600 h-4 rounded-full transition-all duration-300"
                     style={{ width: `${progress}%` }}
                   ></div>
                 </div>
-                <div className="mt-4 space-y-2">
+                <div className="mt-4 space-y-3">
                   {renderProgressDetails()}
                 </div>
               </div>
             )}
 
+            {audioPreviewUrl && (
+              <div className="mt-8 p-4 bg-gray-50 rounded-lg">
+                <h3 className="text-lg font-semibold text-gray-700 mb-3">معاينة الصوت المدبلج</h3>
+                <audio
+                  ref={audioRef}
+                  src={audioPreviewUrl}
+                  controls
+                  className="w-full"
+                  controlsList="nodownload"
+                />
+              </div>
+            )}
+
             {outputUrl && (
-              <div className="mt-6">
-                <p className="text-gray-700 text-center mb-2">الفيديو المدبلج:</p>
+              <div className="mt-8">
+                <h3 className="text-lg font-semibold text-gray-700 mb-3">الفيديو المدبلج</h3>
                 <video
                   ref={videoRef}
                   src={outputUrl}
                   controls
                   className="w-full rounded-lg shadow-md"
                 />
-                <a
-                  href={outputUrl}
-                  download="dubbed_video.mp4"
-                  className="block mt-4 text-center bg-green-500 text-white py-2 rounded-full hover:bg-green-600"
-                >
-                  تحميل الفيديو
-                </a>
+                <div className="mt-4 flex gap-4">
+                  <a
+                    href={outputUrl}
+                    download="dubbed_video.mp4"
+                    className="flex-1 text-center bg-green-600 text-white py-3 rounded-full hover:bg-green-700 transition-colors"
+                  >
+                    تحميل الفيديو
+                  </a>
+                  <button
+                    onClick={() => {
+                      setFile(null);
+                      setOutputUrl('');
+                      setAudioPreviewUrl('');
+                      setProgress(0);
+                      setStatus('');
+                      setError(null);
+                    }}
+                    className="flex-1 bg-gray-600 text-white py-3 rounded-full hover:bg-gray-700 transition-colors"
+                  >
+                    فيديو جديد
+                  </button>
+                </div>
               </div>
             )}
           </form>

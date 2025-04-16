@@ -8,35 +8,37 @@ import os
 from pathlib import Path
 from flask import Flask, request, send_file, render_template_string, jsonify, Response, stream_with_context
 from flask_cors import CORS
-from werkzeug.utils import secure_filename
 import torch
 import torchaudio
 import numpy as np
 import librosa
 import soundfile as sf
+from transformers import pipeline, VitsModel, AutoProcessor
+import whisper
+from gtts import gTTS
 import moviepy.editor as mp
 from datetime import datetime
 import queue
 import threading
-from config import get_config, CONFIG
-from model_manager import ModelManager
 
-# Initialize logging and application
-logger = logging.getLogger("video_dubber")
-logger.setLevel(logging.DEBUG)
-
-# File handler with rotation
+# Configure logging
 log_dir = "logs"
 if not os.path.exists(log_dir):
     os.makedirs(log_dir)
 
+logger = logging.getLogger("video_dubber")
+logger.setLevel(logging.DEBUG)
+
+# File handler with rotation
 file_handler = logging.handlers.RotatingFileHandler(
     os.path.join(log_dir, "video_dubber.log"),
-    maxBytes=10*1024*1024,
+    maxBytes=10*1024*1024,  # 10MB
     backupCount=5,
     encoding='utf-8'
 )
 file_handler.setLevel(logging.DEBUG)
+
+# Console handler
 console_handler = logging.StreamHandler()
 console_handler.setLevel(logging.INFO)
 
@@ -50,9 +52,21 @@ console_handler.setFormatter(console_formatter)
 logger.addHandler(file_handler)
 logger.addHandler(console_handler)
 
+# Flask application setup
 app = Flask(__name__)
 CORS(app)
-app.config['MAX_CONTENT_LENGTH'] = CONFIG['MAX_CONTENT_LENGTH']
+
+class VideoProcessingError(Exception):
+    """Custom exception for video processing errors"""
+    pass
+
+class AudioProcessingError(Exception):
+    """Custom exception for audio processing errors"""
+    pass
+
+class TranslationError(Exception):
+    """Custom exception for translation errors"""
+    pass
 
 # Global progress queue
 progress_queues = {}
@@ -81,50 +95,38 @@ class ProgressTracker:
 class AudioProcessor:
     def __init__(self):
         self.sample_rate = 44100
-
+        
     def separate_audio(self, audio_path, progress_tracker=None):
-        """Separate vocals from background music using librosa"""
+        """Separate vocals from background music"""
         try:
             if progress_tracker:
                 progress_tracker.update_progress('audio_separation', 0, 'بدء فصل الصوت')
             
-            # Load the audio file
             y, sr = librosa.load(audio_path, sr=self.sample_rate)
             
             if progress_tracker:
                 progress_tracker.update_progress('audio_separation', 30, 'تحليل المقطع الصوتي')
             
-            # Compute the spectrogram
+            # Perform source separation using librosa
             S_full, phase = librosa.magphase(librosa.stft(y))
-            
-            # Do soft-masking
-            S_filter = librosa.decompose.nn_filter(
-                S_full,
-                aggregate=np.median,
-                metric='cosine',
-                width=int(librosa.time_to_frames(2, sr=sr))
-            )
-            
+            S_filter = librosa.decompose.nn_filter(S_full,
+                                                 aggregate=np.median,
+                                                 metric='cosine',
+                                                 width=int(librosa.time_to_frames(2, sr=sr)))
             S_filter = np.minimum(S_full, S_filter)
+            margin_v = 2
+            power = 2
             
             if progress_tracker:
                 progress_tracker.update_progress('audio_separation', 60, 'فصل الأصوات')
             
-            # Compute and apply the mask
-            margin = 2
-            power = 2
-            mask = librosa.util.softmask(
-                S_full - S_filter,
-                margin * S_filter,
-                power=power
-            )
+            mask_v = librosa.util.softmask(S_full - S_filter,
+                                         margin_v * S_filter,
+                                         power=power)
+            S_foreground = mask_v * S_full
+            S_background = (1 - mask_v) * S_full
             
-            # Get the foreground (vocals)
-            S_foreground = mask * S_full
-            # Get the background (music)
-            S_background = (1 - mask) * S_full
-            
-            # Convert back to time domain
+            # Convert back to audio
             vocals = librosa.istft(S_foreground * phase)
             background = librosa.istft(S_background * phase)
             
@@ -132,166 +134,270 @@ class AudioProcessor:
                 progress_tracker.update_progress('audio_separation', 100, 'اكتمل فصل الصوت')
             
             return vocals, background, sr
-            
         except Exception as e:
             logger.error(f"Error in audio separation: {str(e)}")
             raise RuntimeError(f"فشل في فصل الصوت: {str(e)}")
 
-    def adjust_audio_durations(self, dubbed_audio, background_audio, target_duration, sr):
-        """Adjust audio durations to match target length"""
+class VoiceCloner:
+    def __init__(self):
+        self.processor = None
+        self.model = None
+        
+    def lazy_load(self):
+        if self.model is None:
+            try:
+                self.model = VitsModel.from_pretrained("facebook/mms-tts-ara")
+                self.processor = AutoProcessor.from_pretrained("facebook/mms-tts-ara")
+            except Exception as e:
+                print(f"Error loading voice model: {str(e)}")
+                # Fallback to basic TTS if model loading fails
+                pass
+    
+    def clone_voice(self, text, reference_audio=None):
         try:
-            # Convert target duration from seconds to samples
-            target_samples = int(target_duration * sr)
-            
-            # Adjust dubbed audio
-            if len(dubbed_audio) < target_samples:
-                # Pad with silence if too short
-                dubbed_audio = np.pad(dubbed_audio, (0, target_samples - len(dubbed_audio)))
-            elif len(dubbed_audio) > target_samples:
-                # Trim if too long
-                dubbed_audio = dubbed_audio[:target_samples]
-            
-            # Adjust background audio similarly
-            if len(background_audio) < target_samples:
-                # Loop the background if too short
-                repeats = int(np.ceil(target_samples / len(background_audio)))
-                background_audio = np.tile(background_audio, repeats)[:target_samples]
-            elif len(background_audio) > target_samples:
-                background_audio = background_audio[:target_samples]
-            
-            return dubbed_audio, background_audio
-            
+            self.lazy_load()
+            if self.model and self.processor:
+                inputs = self.processor(text=text, return_tensors="pt")
+                with torch.no_grad():
+                    output = self.model(**inputs).waveform
+                return output.numpy().squeeze(), self.model.config.sampling_rate
+            else:
+                raise Exception("Model not available")
         except Exception as e:
-            logger.error(f"Error adjusting audio durations: {str(e)}")
-            raise RuntimeError(f"فشل في تعديل مدة المقاطع الصوتية: {str(e)}")
+            print(f"Voice cloning failed: {str(e)}")
+            # Fallback to basic TTS
+            return None, None
 
-    def mix_audio(self, dubbed_audio, background_audio, sr, background_volume=0.3):
-        """Mix dubbed audio with background at specified volume"""
-        try:
-            # Normalize both audio streams
-            dubbed_audio = dubbed_audio / np.max(np.abs(dubbed_audio))
-            background_audio = background_audio / np.max(np.abs(background_audio))
-            
-            # Apply volume adjustment to background
-            background_audio = background_audio * background_volume
-            
-            # Mix the audio streams
-            mixed_audio = dubbed_audio + background_audio
-            
-            # Prevent clipping
-            mixed_audio = mixed_audio / np.max(np.abs(mixed_audio))
-            
-            return mixed_audio
-            
-        except Exception as e:
-            logger.error(f"Error mixing audio: {str(e)}")
-            raise RuntimeError(f"فشل في دمج المقاطع الصوتية: {str(e)}")
-
-    def save_audio(self, audio_data, output_path, sr):
-        """Save audio data to file"""
-        try:
-            sf.write(output_path, audio_data, sr)
-        except Exception as e:
-            logger.error(f"Error saving audio: {str(e)}")
-            raise RuntimeError(f"فشل في حفظ الملف الصوتي: {str(e)}")
+def check_system_requirements():
+    """Check if all required system components are available"""
+    try:
+        # Check FFmpeg
+        result = subprocess.run(['ffmpeg', '-version'], capture_output=True, text=True)
+        if result.returncode != 0:
+            raise RuntimeError("FFmpeg is not installed or not working properly")
+        
+        # Check CUDA availability for PyTorch
+        cuda_available = torch.cuda.is_available()
+        logger.info(f"CUDA available: {cuda_available}")
+        
+        # Check disk space
+        temp_dir = tempfile.gettempdir()
+        total, used, free = shutil.disk_usage(temp_dir)
+        free_gb = free // (2**30)
+        if free_gb < 5:  # Less than 5GB free
+            raise RuntimeError(f"Insufficient disk space. Only {free_gb}GB available")
+        
+        logger.info("System requirements check passed")
+        return True
+    except Exception as e:
+        logger.error(f"System requirements check failed: {str(e)}")
+        raise RuntimeError(f"System requirements check failed: {str(e)}")
 
 class VideoDubber:
     def __init__(self):
+        self.model_size = "base"
         self.temp_dir = None
-        self.model_manager = ModelManager()
-        self.audio_processor = AudioProcessor()
-        self.lip_sync_processor = None  # Lazy initialization
-        self.subtitle_handler = None    # Lazy initialization
+        self.audio_processor = None
+        self.voice_cloner = None
+        self.translator = None
         self.initialized = False
-        self._check_ffmpeg()
-
-    def _check_ffmpeg(self):
-        try:
-            result = subprocess.run(['ffmpeg', '-version'], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-            if result.returncode != 0:
-                raise RuntimeError("FFmpeg غير مثبت أو لا يعمل بشكل صحيح")
-        except FileNotFoundError:
-            raise RuntimeError("FFmpeg غير مثبت. يرجى تثبيت FFmpeg لمعالجة الفيديو.")
-
+        
     def initialize(self):
-        """Initialize all components"""
+        """Initialize all components and models"""
         if self.initialized:
-            return True
+            return
         
         try:
-            logger.info("Initializing video dubber...")
+            logger.info("Initializing VideoDubber components...")
             
-            # Initialize lip sync processor if needed
-            if self.lip_sync_processor is None:
-                from lip_sync import LipSyncProcessor
-                self.lip_sync_processor = LipSyncProcessor()
+            # Check system requirements
+            check_system_requirements()
             
-            # Initialize subtitle handler if needed
-            if self.subtitle_handler is None:
-                from subtitle_handler import SubtitleHandler
-                self.subtitle_handler = SubtitleHandler()
+            # Create temporary directory
+            self.temp_dir = tempfile.mkdtemp()
+            logger.info(f"Created temporary directory: {self.temp_dir}")
             
-            # Verify models are available
-            models_ok, missing_models = self.model_manager.verify_models()
-            if not models_ok:
-                logger.error(f"Missing required models: {missing_models}")
-                raise RuntimeError(f"النماذج المطلوبة غير متوفرة: {', '.join(missing_models)}")
+            # Initialize components
+            self.audio_processor = AudioProcessor()
+            self.voice_cloner = VoiceCloner()
+            
+            # Initialize translator
+            self.translator = pipeline("translation", model="Helsinki-NLP/opus-mt-en-ar")
             
             self.initialized = True
-            logger.info("Video dubber initialized successfully")
-            return True
+            logger.info("VideoDubber initialization complete")
             
         except Exception as e:
-            logger.error(f"Initialization failed: {str(e)}")
+            logger.error(f"Failed to initialize VideoDubber: {str(e)}")
+            self.cleanup()
             raise RuntimeError(f"فشل في تهيئة النظام: {str(e)}")
-            
-    def process_video(self, video_path, progress_tracker=None):
-        """Main video processing pipeline with lip sync and subtitles"""
+    
+    def cleanup(self):
+        """Clean up temporary files and resources"""
         try:
-            # Extract and process audio
-            temp_audio_path = os.path.join(self.temp_dir, 'temp_audio.wav')
-            dubbed_audio_path = os.path.join(self.temp_dir, 'dubbed_audio.mp3')
-            subtitle_path = os.path.join(self.temp_dir, 'subtitles.srt')
-            lip_sync_path = os.path.join(self.temp_dir, 'lip_sync.mp4')
-            final_output_path = os.path.join(self.temp_dir, 'output_dubbed_video.mp4')
-
-            # Extract audio and get duration
-            original_duration = self.extract_audio(video_path, temp_audio_path, progress_tracker)
-            progress_tracker.update_progress('overall', 20, 'تم استخراج الصوت')
-
-            # Transcribe and translate
-            transcribed_text = self.transcribe_audio(temp_audio_path, progress_tracker)
-            progress_tracker.update_progress('overall', 35, 'تم التعرف على النص')
-
-            arabic_text = self.translate_to_arabic(transcribed_text, progress_tracker)
-            progress_tracker.update_progress('overall', 45, 'تمت الترجمة')
-
-            # Generate Arabic audio
-            self.generate_arabic_audio(arabic_text, dubbed_audio_path, original_duration, progress_tracker)
-            progress_tracker.update_progress('overall', 60, 'تم إنشاء الصوت العربي')
-
-            # Process lip sync
-            lip_sync_output = self.lip_sync_processor.process_video(video_path, dubbed_audio_path, progress_tracker)
-            progress_tracker.update_progress('overall', 75, 'تمت مزامنة الشفاه')
-
-            # Generate and burn subtitles
-            self.subtitle_handler.create_subtitle_file(arabic_text, original_duration, subtitle_path, progress_tracker)
-            progress_tracker.update_progress('overall', 85, 'تم إنشاء الترجمات')
-
-            # Merge audio and video with subtitles
-            self.subtitle_handler.burn_subtitles(
-                lip_sync_output,
-                subtitle_path, 
-                final_output_path,
-                progress_tracker
-            )
-            progress_tracker.update_progress('overall', 100, 'اكتمل الدبلاج')
-
-            return final_output_path
-
+            if self.temp_dir and os.path.exists(self.temp_dir):
+                shutil.rmtree(self.temp_dir)
+                logger.info(f"Cleaned up temporary directory: {self.temp_dir}")
         except Exception as e:
-            logger.error(f"Error in video processing: {str(e)}")
-            raise RuntimeError(f"فشل في معالجة الفيديو: {str(e)}")
+            logger.error(f"Error during cleanup: {str(e)}")
+
+    def initialize_session(self):
+        """Create a new temporary directory for this session"""
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            try:
+                shutil.rmtree(self.temp_dir)
+            except Exception as e:
+                logger.error(f"Error cleaning up old temp directory: {str(e)}")
+        
+        self.temp_dir = tempfile.mkdtemp()
+        return self.temp_dir
+
+    def cleanup_session(self):
+        """Clean up temporary files"""
+        if self.temp_dir and os.path.exists(self.temp_dir):
+            try:
+                shutil.rmtree(self.temp_dir)
+            except Exception as e:
+                logger.error(f"Error cleaning up temp directory: {str(e)}")
+
+    def extract_audio(self, video_path, audio_path, progress_tracker=None):
+        try:
+            if progress_tracker:
+                progress_tracker.update_progress('extraction', 0, 'بدء استخراج الصوت')
+            
+            video = mp.VideoFileClip(video_path)
+            if video.audio is None:
+                raise ValueError("الفيديو لا يحتوي على مسار صوتي")
+            
+            if progress_tracker:
+                progress_tracker.update_progress('extraction', 50, 'جارٍ استخراج الصوت')
+            
+            video.audio.write_audiofile(audio_path)
+            duration = video.duration
+            video.close()
+            
+            if progress_tracker:
+                progress_tracker.update_progress('extraction', 100, 'تم استخراج الصوت بنجاح')
+            
+            return duration
+        except Exception as e:
+            logger.error(f"Error extracting audio: {str(e)}")
+            raise RuntimeError(f"فشل في استخراج الصوت من الفيديو: {str(e)}")
+
+    def transcribe_audio(self, audio_path, progress_tracker=None):
+        try:
+            if progress_tracker:
+                progress_tracker.update_progress('transcription', 0, 'بدء تحويل الصوت إلى نص')
+            
+            model = whisper.load_model(self.model_size)
+            result = model.transcribe(audio_path)
+            
+            if progress_tracker:
+                progress_tracker.update_progress('transcription', 50, 'جارٍ تحويل الصوت إلى نص')
+            
+            if not result.get("text"):
+                raise ValueError("لم يتم العثور على نص في الصوت")
+            
+            if progress_tracker:
+                progress_tracker.update_progress('transcription', 100, 'تم تحويل الصوت إلى نص بنجاح')
+            
+            return result["text"]
+        except Exception as e:
+            logger.error(f"Error in audio transcription: {str(e)}")
+            raise RuntimeError(f"فشل في تحويل الصوت إلى نص: {str(e)}")
+
+    def translate_to_arabic(self, text, progress_tracker=None):
+        try:
+            if progress_tracker:
+                progress_tracker.update_progress('translation', 0, 'بدء الترجمة إلى العربية')
+            
+            translator = pipeline("translation", model="Helsinki-NLP/opus-mt-en-ar")
+            translated = translator(text)
+            
+            if progress_tracker:
+                progress_tracker.update_progress('translation', 50, 'جارٍ الترجمة إلى العربية')
+            
+            if not translated or not translated[0].get("translation_text"):
+                raise ValueError("فشل في ترجمة النص")
+            
+            if progress_tracker:
+                progress_tracker.update_progress('translation', 100, 'تمت الترجمة إلى العربية بنجاح')
+            
+            return translated[0]["translation_text"]
+        except Exception as e:
+            logger.error(f"Error in translation: {str(e)}")
+            raise RuntimeError(f"فشل في الترجمة: {str(e)}")
+
+    def generate_arabic_audio(self, text, output_audio_path, original_duration, progress_tracker=None):
+        try:
+            if progress_tracker:
+                progress_tracker.update_progress('audio_generation', 0, 'بدء إنشاء الصوت العربي')
+            
+            # Try voice cloning first
+            audio_data, sample_rate = self.voice_cloner.clone_voice(text)
+            
+            if audio_data is not None:
+                sf.write(output_audio_path, audio_data, sample_rate)
+            else:
+                # Fallback to traditional TTS
+                tts = gTTS(text=text, lang='ar')
+                tts.save(output_audio_path)
+            
+            # Load and adjust audio duration
+            audio = mp.AudioFileClip(output_audio_path)
+            if audio.duration < original_duration:
+                audio = mp.concatenate_audioclips([audio, mp.AudioClip(lambda t: 0, duration=original_duration - audio.duration)])
+            elif audio.duration > original_duration:
+                audio = audio.subclip(0, original_duration)
+            
+            audio.write_audiofile(output_audio_path)
+            audio.close()
+            
+            if progress_tracker:
+                progress_tracker.update_progress('audio_generation', 100, 'تم إنشاء الصوت العربي بنجاح')
+        except Exception as e:
+            logger.error(f"Error in generating Arabic audio: {str(e)}")
+            raise RuntimeError(f"فشل في إنشاء الصوت العربي: {str(e)}")
+
+    def merge_audio_video(self, video_path, dubbed_audio_path, original_audio_path, output_path, progress_tracker=None, background_mix_ratio=0.3):
+        try:
+            if progress_tracker:
+                progress_tracker.update_progress('merging', 0, 'بدء دمج الصوت مع الفيديو')
+            
+            # Separate background audio
+            vocals, background, sr = self.audio_processor.separate_audio(original_audio_path, progress_tracker)
+            
+            # Save background audio temporarily
+            background_path = os.path.join(self.temp_dir, 'background.wav')
+            sf.write(background_path, background, sr)
+            
+            # Load all audio components
+            dubbed_audio = mp.AudioFileClip(dubbed_audio_path)
+            background_audio = mp.AudioFileClip(background_path)
+            
+            # Mix dubbed audio with background
+            mixed_audio = mp.CompositeAudioClip([
+                dubbed_audio.volumex(1.0),
+                background_audio.volumex(background_mix_ratio)
+            ])
+            
+            # Merge with video
+            video = mp.VideoFileClip(video_path)
+            final_video = video.set_audio(mixed_audio)
+            final_video.write_videofile(output_path, codec="libx264", audio_codec="aac")
+            
+            # Cleanup
+            video.close()
+            dubbed_audio.close()
+            background_audio.close()
+            final_video.close()
+            os.remove(background_path)
+            
+            if progress_tracker:
+                progress_tracker.update_progress('merging', 100, 'اكتمل دمج الصوت مع الفيديو')
+        except Exception as e:
+            logger.error(f"Error in merging audio and video: {str(e)}")
+            raise RuntimeError(f"فشل في دمج الصوت مع الفيديو: {str(e)}")
 
 # Initialize the dubber
 dubber = VideoDubber()
@@ -345,11 +451,6 @@ def dub_video():
     if video_file.filename == '':
         return jsonify({'error': 'لم يتم اختيار ملف'}), 400
 
-    # Get options from request
-    enable_lip_sync = request.form.get('enableLipSync', 'false').lower() == 'true'
-    enable_subtitles = request.form.get('enableSubtitles', 'false').lower() == 'true'
-    background_volume = float(request.form.get('backgroundVolume', '30')) / 100.0  # Convert percentage to decimal
-
     # Generate session ID
     session_id = datetime.now().strftime('%Y%m%d_%H%M%S_') + secure_filename(video_file.filename)
     progress_tracker = ProgressTracker(session_id)
@@ -371,65 +472,24 @@ def dub_video():
         # Process paths
         temp_audio_path = os.path.join(dubber.temp_dir, 'temp_audio.wav')
         dubbed_audio_path = os.path.join(dubber.temp_dir, 'dubbed_audio.mp3')
-        subtitle_path = os.path.join(dubber.temp_dir, 'subtitles.srt')
-        lip_sync_path = os.path.join(dubber.temp_dir, 'lip_sync.mp4')
         output_video_path = os.path.join(dubber.temp_dir, 'output_dubbed_video.mp4')
 
         # Extract and process audio with progress tracking
         progress_tracker.update_progress('overall', 0, 'بدء المعالجة')
         
         original_duration = dubber.extract_audio(video_path, temp_audio_path, progress_tracker)
-        progress_tracker.update_progress('overall', 15, 'تم استخراج الصوت')
+        progress_tracker.update_progress('overall', 20, 'تم استخراج الصوت')
         
         transcribed_text = dubber.transcribe_audio(temp_audio_path, progress_tracker)
-        progress_tracker.update_progress('overall', 30, 'تم التعرف على النص')
+        progress_tracker.update_progress('overall', 40, 'تم التعرف على النص')
         
         arabic_text = dubber.translate_to_arabic(transcribed_text, progress_tracker)
-        progress_tracker.update_progress('overall', 45, 'تمت الترجمة')
+        progress_tracker.update_progress('overall', 60, 'تمت الترجمة')
         
         dubber.generate_arabic_audio(arabic_text, dubbed_audio_path, original_duration, progress_tracker)
-        progress_tracker.update_progress('overall', 60, 'تم إنشاء الصوت العربي')
-
-        # Process with lip sync if enabled
-        current_video = video_path
-        if enable_lip_sync:
-            progress_tracker.update_progress('overall', 70, 'جارٍ مزامنة الشفاه')
-            lip_sync_output = dubber.lip_sync_processor.process_video(
-                current_video, 
-                dubbed_audio_path, 
-                progress_tracker
-            )
-            current_video = lip_sync_output
-            progress_tracker.update_progress('overall', 80, 'تمت مزامنة الشفاه')
-
-        # Generate subtitles if enabled
-        if enable_subtitles:
-            progress_tracker.update_progress('overall', 85, 'جارٍ إنشاء الترجمات')
-            dubber.subtitle_handler.create_subtitle_file(
-                arabic_text, 
-                original_duration, 
-                subtitle_path, 
-                progress_tracker
-            )
-            dubber.subtitle_handler.burn_subtitles(
-                current_video,
-                subtitle_path, 
-                output_video_path,
-                progress_tracker
-            )
-            current_video = output_video_path
-            progress_tracker.update_progress('overall', 90, 'تم إضافة الترجمات')
-
-        # Final audio-video merge
-        progress_tracker.update_progress('overall', 95, 'جارٍ دمج الصوت النهائي')
-        dubber.merge_audio_video(
-            current_video, 
-            dubbed_audio_path, 
-            temp_audio_path, 
-            output_video_path, 
-            progress_tracker,
-            background_mix_ratio=background_volume
-        )
+        progress_tracker.update_progress('overall', 80, 'تم إنشاء الصوت العربي')
+        
+        dubber.merge_audio_video(video_path, dubbed_audio_path, temp_audio_path, output_video_path, progress_tracker)
         progress_tracker.update_progress('overall', 100, 'اكتمل الدبلاج')
 
         # Send the output video file
